@@ -6,11 +6,16 @@ import plotly.express as px
 # page config
 st.set_page_config(page_title="Portfolio Analyzer Pro", layout="wide")
 
-# region name keywords for etf detection
+# region name keywords for etf/mutual fund detection
+# expanded to include common canadian mutual fund name patterns
 REGION_NAME_KEYWORDS = {
-    "us":            ["U.S.", "US ", "S&P 500", "NASDAQ", "RUSSELL", "VUN", "XUS", "VSP", "ZSP", "HXS"],
-    "international": ["INTL", "INTERNATIONAL", "EMERGING", "VIU", "XEF", "XEC", "ZEM", "EAFE"],
+    "us":            ["U.S.", "US ", "S&P 500", "NASDAQ", "RUSSELL", "VUN", "XUS", "VSP",
+                      "ZSP", "HXS", "AMERICAN", "UNITED STATES"],
+    "canada":        ["CANADIAN", "CANADA", "TSX", "RBC CANADIAN", "TD CANADIAN", "FIDELITY CANADIAN"],
+    "international": ["INTL", "INTERNATIONAL", "EMERGING", "VIU", "XEF", "XEC", "ZEM",
+                      "EAFE", "GLOBAL", "WORLD"],
 }
+
 
 def detect_region_for_etf(ticker_symbol, long_name, market):
     # use name keywords and market field instead of absent country field
@@ -26,11 +31,15 @@ def detect_region_for_etf(ticker_symbol, long_name, market):
         if "us" in market:
             return "us"
 
-    return "international"  # safer default than "canada" for unknown etfs
+    # canadian mutual funds often use .TO or .CF suffix — default to canada
+    if ticker_symbol.endswith(".TO") or ticker_symbol.endswith(".CF"):
+        return "canada"
+
+    return "international"  # safer default than "canada" for unknown etfs/funds
 
 
 def parse_sector_weightings(weights_raw):
-    # sectorWeightings can be a list of single-key dicts OR a plain dict
+    # sector weightings can be a list of single-key dicts OR a plain dict
     result = {}
     if isinstance(weights_raw, list):
         for item in weights_raw:
@@ -44,7 +53,6 @@ def parse_sector_weightings(weights_raw):
 
 
 def get_top_holdings(ticker_obj):
-    # real yfinance columns are camelCase and symbol is often the index, not a column
     try:
         df = ticker_obj.funds_data.top_holdings
         if df is None or df.empty:
@@ -82,6 +90,22 @@ def get_top_holdings(ticker_obj):
         return None
 
 
+def get_price(ticker_obj, info):
+    # fast_info is preferred, but canadian mutual funds often fail there
+    # fall back through multiple yfinance price fields before giving up
+    try:
+        return ticker_obj.fast_info["last_price"]
+    except (KeyError, Exception):
+        pass
+
+    for field in ("regularMarketPrice", "previousClose", "navPrice"):
+        price = info.get(field)
+        if price:
+            return price
+
+    return None
+
+
 def analyze_portfolio_with_api(holdings_list):
     region_summary = {"canada": 0.0, "us": 0.0, "international": 0.0}
     sector_summary = {}
@@ -106,8 +130,16 @@ def analyze_portfolio_with_api(holdings_list):
             # fetch data
             ticker_obj = yf.Ticker(ticker_symbol)
             info = ticker_obj.info
-            price = ticker_obj.fast_info["last_price"]
-            currency = info.get("currency", "USD")
+
+            # get price with fallback chain for canadian mutual funds
+            price = get_price(ticker_obj, info)
+            if price is None:
+                st.warning(f"Could not get price for {ticker_symbol} — skipping.")
+                continue
+
+            # default currency to CAD for canadian mutual funds since yfinance
+            # often omits the currency field entirely for them
+            currency = info.get("currency") or ("CAD" if "ca" in info.get("market", "") else "USD")
 
             # currency conversion
             price_cad = price * usdcad_rate if currency == "USD" else price
@@ -120,6 +152,8 @@ def analyze_portfolio_with_api(holdings_list):
             is_fund = quote_type in ("ETF", "MUTUALFUND")
 
             # unpack etf/mf holdings if possible, otherwise treat as single stock
+            # note: canadian mutual funds rarely have holdings data in yfinance,
+            # so they will almost always fall through to the single-position bucket
             holdings_unpacked = False
             if is_fund:
                 df_h = get_top_holdings(ticker_obj)
@@ -137,6 +171,10 @@ def analyze_portfolio_with_api(holdings_list):
                         stock_exposure[rem_key] = (
                             stock_exposure.get(rem_key, 0) + value_cad * (1.0 - known_pct)
                         )
+                else:
+                    # no holdings data available — common for canadian mutual funds
+                    # show the fund itself as a single exposure bucket
+                    st.info(f"{ticker_symbol}: No holdings data available — shown as a single position.")
 
             if not holdings_unpacked:
                 stock_exposure[ticker_symbol] = stock_exposure.get(ticker_symbol, 0) + value_cad
@@ -162,7 +200,8 @@ def analyze_portfolio_with_api(holdings_list):
                 for s_name, s_perc in sector_weights.items():
                     sector_summary[s_name] = sector_summary.get(s_name, 0) + value_cad * s_perc
             else:
-                # individual stock, or etf where yfinance returned no sector data
+                # individual stock, or fund where yfinance returned no sector data
+                # (very common for canadian mutual funds — they show up as "unknown")
                 s_name = (info.get("sector") or "unknown").lower()
                 sector_summary[s_name] = sector_summary.get(s_name, 0) + value_cad
 
@@ -192,13 +231,15 @@ if st.button("Analyze Portfolio"):
     with col1:
         st.subheader("Regional Allocation")
         region_df = pd.DataFrame([{"Region": r.title(), "Value": v} for r, v in regions.items() if v > 0])
-        fig_reg = px.pie(region_df, values='Value', names='Region', hole=0.4, color_discrete_sequence=px.colors.qualitative.Pastel)
+        fig_reg = px.pie(region_df, values='Value', names='Region', hole=0.4,
+                         color_discrete_sequence=px.colors.qualitative.Pastel)
         st.plotly_chart(fig_reg, use_container_width=True)
 
     with col2:
         st.subheader("Sector Exposure")
         sector_df = pd.DataFrame([{"Sector": s.title(), "Value": v} for s, v in sectors.items() if v > 0])
-        fig_sec = px.pie(sector_df, values='Value', names='Sector', hole=0.4, color_discrete_sequence=px.colors.qualitative.Safe)
+        fig_sec = px.pie(sector_df, values='Value', names='Sector', hole=0.4,
+                         color_discrete_sequence=px.colors.qualitative.Safe)
         st.plotly_chart(fig_sec, use_container_width=True)
 
     # stock exposure
@@ -206,7 +247,7 @@ if st.button("Analyze Portfolio"):
     st.subheader("Top Individual Stock Exposure")
 
     # process stock data for chart
-    stock_list = [{"Ticker": t, "Value": v, "Percent": (v/total)*100} for t, v in stocks.items()]
+    stock_list = [{"Ticker": t, "Value": v, "Percent": (v / total) * 100} for t, v in stocks.items()]
     stock_df = pd.DataFrame(stock_list).sort_values(by="Value", ascending=False).head(15)  # top 15
 
     fig_stocks = px.bar(
