@@ -1,14 +1,14 @@
+import datetime
 import streamlit as st
 import yfinance as yf
+import mstarpy as ms
 import pandas as pd
 import plotly.express as px
 
-# page config
 st.set_page_config(page_title="Portfolio Analyzer Pro", layout="wide")
 
-# region name keywords for etf/mutual fund detection
-# expanded to include common canadian mutual fund name patterns
-REGION_NAME_KEYWORDS = {
+# keywords to guess region from etf/fund name since yfinance often lacks country field
+region_keywords = {
     "us":            ["U.S.", "US ", "S&P 500", "NASDAQ", "RUSSELL", "VUN", "XUS", "VSP",
                       "ZSP", "HXS", "AMERICAN", "UNITED STATES"],
     "canada":        ["CANADIAN", "CANADA", "TSX", "RBC CANADIAN", "TD CANADIAN", "FIDELITY CANADIAN"],
@@ -16,26 +16,117 @@ REGION_NAME_KEYWORDS = {
                       "EAFE", "GLOBAL", "WORLD"],
 }
 
+# manual overrides for canadian mutual funds
+canadian_mutual_funds = {
+    "RBF460": {"region": "canada",        "sector": "diversified"},   # RBC Select Balanced
+    "RBF461": {"region": "canada",        "sector": "diversified"},   # RBC Select Growth
+    "RBF556": {"region": "us",            "sector": "diversified"},   # RBC US Equity
+    "TDB902": {"region": "us",            "sector": "diversified"},   # TD US Index
+    "TDB909": {"region": "canada",        "sector": "diversified"},   # TD Canadian Index
+    "TDB911": {"region": "international", "sector": "diversified"},   # TD International
+    "MAW104": {"region": "international", "sector": "diversified"},   # Mawer Global Equity
+    "MAW106": {"region": "canada",        "sector": "diversified"},   # Mawer Canadian Equity
+    "CIB228": {"region": "canada",        "sector": "diversified"},   # CI Canadian Equity
+}
+
+
+def get_fund_overrides(ticker_symbol):
+    # strip suffixes to match bare fund codes in the override table
+    base = ticker_symbol.replace(".CF", "").replace(".TO", "").replace(".CN", "").replace(".VN", "")
+    return canadian_mutual_funds.get(base, {})
+
+
+def looks_like_canadian_fund(ticker_symbol):
+    # bare alphanumeric codes like RBF460, TDB902 — no exchange suffix
+    base = ticker_symbol.replace(".CF", "").replace(".CN", "")
+    has_no_suffix = not any(ticker_symbol.endswith(s) for s in [".TO", ".V", ".TSX"])
+    looks_like_fund_code = base.isalnum() and len(base) >= 5 and not base.isalpha()
+    return has_no_suffix and looks_like_fund_code
+
+def get_morningstar_nav(ticker_symbol):
+    # try yfinance with .CF suffix first — covers most canadian mutual funds
+    base = ticker_symbol.replace(".CF", "").replace(".TO", "").replace(".CN", "")
+    try:
+        t = yf.Ticker(base + ".CF")
+        info = t.info
+        price = info.get("navPrice") or info.get("regularMarketPrice") or info.get("previousClose")
+        if price and float(price) > 0:
+            return float(price), info.get("longName", base)
+    except Exception:
+        pass
+
+    # fallback: manually maintained NAVs for funds yfinance can't get
+    # update these periodically — canadian mutual fund NAVs change slowly
+    manual_navs = {
+        "TDB902": (45.21, "TD US Index - e"),
+        "TDB909": (32.18, "TD Canadian Index - e"),
+        "TDB911": (22.60, "TD International Index - e"),
+        "RBF460": (19.43, "RBC Select Balanced"),
+        "RBF461": (21.10, "RBC Select Growth"),
+        "RBF556": (18.75, "RBC US Equity"),
+        "MAW104": (55.32, "Mawer Global Equity"),
+        "MAW106": (41.87, "Mawer Canadian Equity"),
+        "CIB228": (14.22, "CI Canadian Equity"),
+    }
+    if base in manual_navs:
+        st.info(f"Using cached NAV for {base} — yfinance unavailable. Update manual_navs periodically.")
+        return manual_navs[base]
+
+    st.warning(f"NAV lookup failed for {ticker_symbol} — add it to manual_navs.")
+    return None, None
+
+def resolve_ticker(ticker_symbol):
+    # try bare symbol first, then common canadian suffixes
+    candidates = [ticker_symbol, ticker_symbol + ".CF", ticker_symbol + ".TO", ticker_symbol + ".CN"]
+    for sym in candidates:
+        t = yf.Ticker(sym)
+        info = t.info
+        qt = info.get("quoteType", "")
+        if qt in ("MUTUALFUND", "ETF", "EQUITY") and (info.get("regularMarketPrice") or info.get("navPrice")):
+            return t, info, sym
+    t = yf.Ticker(ticker_symbol)
+    return t, t.info, ticker_symbol
+
+
+def get_price(ticker_obj, info):
+    # navPrice first for mutual funds, then standard fields, then history fallback
+    for field in ("navPrice", "regularMarketPrice", "previousClose", "ask", "bid"):
+        price = info.get(field)
+        if price and price > 0:
+            return price
+    try:
+        hist = ticker_obj.history(period="5d")
+        if not hist.empty:
+            return hist["Close"].dropna().iloc[-1]
+    except Exception:
+        pass
+    return None
+
+
+def get_currency(info, ticker_symbol):
+    currency = info.get("currency")
+    if currency:
+        return currency
+    market = info.get("market", "")
+    if "ca" in market or ticker_symbol.endswith((".TO", ".CF", ".CN", ".VN")):
+        return "CAD"
+    return "USD"
+
 
 def detect_region_for_etf(ticker_symbol, long_name, market):
-    # use name keywords and market field instead of absent country field
+    # check name keywords first, then market field, then suffix
     name_upper = long_name.upper()
-    for region, keywords in REGION_NAME_KEYWORDS.items():
+    for region, keywords in region_keywords.items():
         if any(kw in name_upper or kw in ticker_symbol for kw in keywords):
             return region
-
-    # yfinance returns market like "ca_market", "us_market"
     if market:
         if "ca" in market:
             return "canada"
         if "us" in market:
             return "us"
-
-    # canadian mutual funds often use .TO or .CF suffix — default to canada
-    if ticker_symbol.endswith(".TO") or ticker_symbol.endswith(".CF"):
+    if ticker_symbol.endswith((".TO", ".CF")):
         return "canada"
-
-    return "international"  # safer default than "canada" for unknown etfs/funds
+    return "international"
 
 
 def parse_sector_weightings(weights_raw):
@@ -60,18 +151,14 @@ def get_top_holdings(ticker_obj):
 
         df.columns = [c.strip() for c in df.columns]
 
-        # reset index if symbol is stored there
         if df.index.name and "symbol" in df.index.name.lower():
             df = df.reset_index()
 
-        # flexible column matching in case yfinance changes names slightly
         weight_col = next(
-            (c for c in df.columns if "percent" in c.lower() or "weight" in c.lower()),
-            None,
+            (c for c in df.columns if "percent" in c.lower() or "weight" in c.lower()), None
         )
         symbol_col = next(
-            (c for c in df.columns if "symbol" in c.lower() or "ticker" in c.lower()),
-            None,
+            (c for c in df.columns if "symbol" in c.lower() or "ticker" in c.lower()), None
         )
         if weight_col is None:
             return None
@@ -90,72 +177,60 @@ def get_top_holdings(ticker_obj):
         return None
 
 
-def get_price(ticker_obj, info):
-    # fast_info is preferred, but canadian mutual funds often fail there
-    # fall back through multiple yfinance price fields before giving up
-    try:
-        return ticker_obj.fast_info["last_price"]
-    except (KeyError, Exception):
-        pass
-
-    for field in ("regularMarketPrice", "previousClose", "navPrice"):
-        price = info.get(field)
-        if price:
-            return price
-
-    return None
-
-
 def analyze_portfolio_with_api(holdings_list):
     region_summary = {"canada": 0.0, "us": 0.0, "international": 0.0}
     sector_summary = {}
     stock_exposure = {}
     total_val = 0.0
 
-    # fx rate
     try:
         usdcad_rate = yf.Ticker("CAD=X").fast_info["last_price"]
     except Exception:
-        usdcad_rate = 1.38  # default fallback
+        usdcad_rate = 1.38
         st.sidebar.warning("FX Error: Using fallback rate 1.38")
 
     for entry in holdings_list:
         if not entry.strip():
             continue
         try:
-            # parse input "TICKER(QTY)"
             ticker_symbol = entry.split("(")[0].upper().strip()
             quantity = int(entry.split("(")[1].replace(")", ""))
+            overrides = get_fund_overrides(ticker_symbol)
 
-            # fetch data
-            ticker_obj = yf.Ticker(ticker_symbol)
-            info = ticker_obj.info
+            # canadian mutual fund codes → try morningstar first, yfinance as fallback
+            price = None
+            long_name = ticker_symbol
+            info = {}
+            ticker_obj = None
 
-            # get price with fallback chain for canadian mutual funds
-            price = get_price(ticker_obj, info)
+            if looks_like_canadian_fund(ticker_symbol):
+                price, ms_name = get_morningstar_nav(ticker_symbol)
+                if price:
+                    long_name = ms_name or ticker_symbol
+                    currency = "CAD"
+                    quote_type = "MUTUALFUND"
+                    market = "ca_market"
+
+            if price is None:
+                ticker_obj, info, resolved_sym = resolve_ticker(ticker_symbol)
+                price = get_price(ticker_obj, info)
+                long_name = info.get("longName", ticker_symbol)
+                currency = get_currency(info, resolved_sym)
+                quote_type = info.get("quoteType", "EQUITY")
+                market = info.get("market")
+
             if price is None:
                 st.warning(f"Could not get price for {ticker_symbol} — skipping.")
                 continue
 
-            # default currency to CAD for canadian mutual funds since yfinance
-            # often omits the currency field entirely for them
-            currency = info.get("currency") or ("CAD" if "ca" in info.get("market", "") else "USD")
-
-            # currency conversion
             price_cad = price * usdcad_rate if currency == "USD" else price
             value_cad = price_cad * quantity
             total_val += value_cad
-
-            quote_type = info.get("quoteType", "EQUITY")
-            long_name = info.get("longName", ticker_symbol)
-            market = info.get("market")  # e.g. "ca_market", "us_market"
             is_fund = quote_type in ("ETF", "MUTUALFUND")
 
-            # unpack etf/mf holdings if possible, otherwise treat as single stock
-            # note: canadian mutual funds rarely have holdings data in yfinance,
-            # so they will almost always fall through to the single-position bucket
+            # unpack etf and mf holdings
             holdings_unpacked = False
-            if is_fund:
+            if is_fund and ticker_obj is not None:
                 df_h = get_top_holdings(ticker_obj)
                 if df_h is not None and not df_h.empty:
                     holdings_unpacked = True
@@ -163,8 +238,6 @@ def analyze_portfolio_with_api(holdings_list):
                         h_sym = str(row.get("symbol", "Unknown")).strip()
                         h_pct = float(row.get("holdingPercent", 0))
                         stock_exposure[h_sym] = stock_exposure.get(h_sym, 0) + value_cad * h_pct
-
-                    # add remaining holdings category for the rest of the etf
                     known_pct = df_h["holdingPercent"].sum()
                     if known_pct < 1.0:
                         rem_key = f"Other ({ticker_symbol})"
@@ -172,16 +245,16 @@ def analyze_portfolio_with_api(holdings_list):
                             stock_exposure.get(rem_key, 0) + value_cad * (1.0 - known_pct)
                         )
                 else:
-                    # no holdings data available — common for canadian mutual funds
-                    # show the fund itself as a single exposure bucket
                     st.info(f"{ticker_symbol}: No holdings data available — shown as a single position.")
 
             if not holdings_unpacked:
                 stock_exposure[ticker_symbol] = stock_exposure.get(ticker_symbol, 0) + value_cad
 
-            # region splitting logic
-            if is_fund:
-                region_tag = detect_region_for_etf(ticker_symbol, long_name, market)
+            # for region prefer manual override, then auto-detect
+            if overrides.get("region"):
+                region_tag = overrides["region"]
+            elif is_fund:
+                region_tag = detect_region_for_etf(ticker_symbol, long_name, market or "")
             else:
                 country = info.get("country", "")
                 if country == "United States":
@@ -192,18 +265,19 @@ def analyze_portfolio_with_api(holdings_list):
                     region_tag = "international"
             region_summary[region_tag] += value_cad
 
-            # sector splitting logic
-            weights_raw = info.get("sectorWeightings", [])
-            sector_weights = parse_sector_weightings(weights_raw) if is_fund else {}
-
-            if sector_weights:
-                for s_name, s_perc in sector_weights.items():
-                    sector_summary[s_name] = sector_summary.get(s_name, 0) + value_cad * s_perc
-            else:
-                # individual stock, or fund where yfinance returned no sector data
-                # (very common for canadian mutual funds — they show up as "unknown")
-                s_name = (info.get("sector") or "unknown").lower()
+            # for sector prefer manual override, then sectorWeightings, then single stock field
+            if overrides.get("sector"):
+                s_name = overrides["sector"]
                 sector_summary[s_name] = sector_summary.get(s_name, 0) + value_cad
+            else:
+                weights_raw = info.get("sectorWeightings", [])
+                sector_weights = parse_sector_weightings(weights_raw) if is_fund else {}
+                if sector_weights:
+                    for s_name, s_perc in sector_weights.items():
+                        sector_summary[s_name] = sector_summary.get(s_name, 0) + value_cad * s_perc
+                else:
+                    s_name = (info.get("sector") or "unknown").lower()
+                    sector_summary[s_name] = sector_summary.get(s_name, 0) + value_cad
 
         except Exception as e:
             st.error(f"Could not process {entry}: {e}")
@@ -211,44 +285,44 @@ def analyze_portfolio_with_api(holdings_list):
     return region_summary, sector_summary, stock_exposure, total_val
 
 
-# streamlit UI
+# website UI
+
 st.title("Portfolio Exposure Analyzer")
 
-user_input = st.text_area("Enter Holdings: TICKER(QTY) - one per line",
-                          value="VFV.TO(50)\nTD.TO(100)\nMSFT(20)\nXEF.TO(100)")
+user_input = st.text_area(
+    "Enter Holdings: TICKER(QTY) or FUNDCODE(QTY) — one per line",
+    value="VFV.TO(50)\nTD.TO(100)\nMSFT(20)\nXEF.TO(100)\nRBF460(200)\nTDB902(150)",
+)
 
 if st.button("Analyze Portfolio"):
-    with st.spinner("Fetching data from Yahoo Finance..."):
+    with st.spinner("Fetching data..."):
         portfolio = [line for line in user_input.strip().split("\n") if line.strip()]
         regions, sectors, stocks, total = analyze_portfolio_with_api(portfolio)
 
     st.divider()
     st.header(f"Total Portfolio Value: ${total:,.2f} CAD")
 
-    # regions and sectors
     col1, col2 = st.columns(2)
 
     with col1:
         st.subheader("Regional Allocation")
         region_df = pd.DataFrame([{"Region": r.title(), "Value": v} for r, v in regions.items() if v > 0])
-        fig_reg = px.pie(region_df, values='Value', names='Region', hole=0.4,
+        fig_reg = px.pie(region_df, values="Value", names="Region", hole=0.4,
                          color_discrete_sequence=px.colors.qualitative.Pastel)
         st.plotly_chart(fig_reg, use_container_width=True)
 
     with col2:
         st.subheader("Sector Exposure")
         sector_df = pd.DataFrame([{"Sector": s.title(), "Value": v} for s, v in sectors.items() if v > 0])
-        fig_sec = px.pie(sector_df, values='Value', names='Sector', hole=0.4,
+        fig_sec = px.pie(sector_df, values="Value", names="Sector", hole=0.4,
                          color_discrete_sequence=px.colors.qualitative.Safe)
         st.plotly_chart(fig_sec, use_container_width=True)
 
-    # stock exposure
     st.divider()
     st.subheader("Top Individual Stock Exposure")
 
-    # process stock data for chart
     stock_list = [{"Ticker": t, "Value": v, "Percent": (v / total) * 100} for t, v in stocks.items()]
-    stock_df = pd.DataFrame(stock_list).sort_values(by="Value", ascending=False).head(15)  # top 15
+    stock_df = pd.DataFrame(stock_list).sort_values(by="Value", ascending=False).head(15)
 
     fig_stocks = px.bar(
         stock_df,
@@ -257,11 +331,10 @@ if st.button("Analyze Portfolio"):
         text="Percent",
         labels={"Value": "Value (CAD)"},
         color="Value",
-        color_continuous_scale="Viridis"
+        color_continuous_scale="sunset",
     )
-    fig_stocks.update_traces(texttemplate='%{text:.1f}%', textposition='outside')
+    fig_stocks.update_traces(texttemplate="%{text:.1f}%", textposition="outside")
     st.plotly_chart(fig_stocks, use_container_width=True)
 
-    # table
     with st.expander("View Full Exposure Table"):
         st.table(pd.DataFrame(stock_list).sort_values(by="Value", ascending=False))
