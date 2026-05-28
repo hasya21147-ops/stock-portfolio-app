@@ -44,7 +44,7 @@ def looks_like_canadian_fund(ticker_symbol):
     return has_no_suffix and looks_like_fund_code
 
 def get_morningstar_nav(ticker_symbol):
-    # try yfinance with .CF suffix first — covers most canadian mutual funds
+    # try yfinance with .CF suffix first 
     base = ticker_symbol.replace(".CF", "").replace(".TO", "").replace(".CN", "")
     try:
         t = yf.Ticker(base + ".CF")
@@ -177,6 +177,71 @@ def get_top_holdings(ticker_obj):
         return None
 
 
+def get_portfolio_history(holdings_list, usdcad_rate, regions_snapshot, sectors_snapshot, total_snapshot):
+    # regions_snapshot / sectors_snapshot are today's % splits — we apply them to each ticker's history
+    # this is an approximation; exact historical splits aren't available without paid data
+    ticker_meta = {}   # ticker → {quantity, multiplier, region_tag, sector_tag}
+
+    for entry in holdings_list:
+        if not entry.strip():
+            continue
+        try:
+            ticker_symbol = entry.split("(")[0].upper().strip()
+            quantity = int(entry.split("(")[1].replace(")", ""))
+
+            # skip canadian mutual fund codes — no daily NAV history in yfinance
+            if looks_like_canadian_fund(ticker_symbol):
+                continue
+
+            t = yf.Ticker(ticker_symbol)
+            info = t.info
+            currency = get_currency(info, ticker_symbol)
+            multiplier = usdcad_rate if currency == "USD" else 1.0
+            ticker_meta[ticker_symbol] = {"qty": quantity, "mult": multiplier, "obj": t}
+        except Exception:
+            continue
+
+    if not ticker_meta:
+        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
+
+    # fetch all histories in one batch call — much faster, avoids partial gaps causing drops
+    syms = list(ticker_meta.keys())
+    raw = yf.download(syms, period="1y", auto_adjust=True, progress=False)["Close"]
+
+    # yfinance returns a Series (not df) when only one ticker
+    if isinstance(raw, pd.Series):
+        raw = raw.to_frame(name=syms[0])
+
+    # forward-fill then back-fill to patch missing days (holidays, gaps) — fixes the random drops
+    raw = raw.ffill().bfill()
+
+    # build per-ticker value series
+    value_df = pd.DataFrame(index=raw.index)
+    for sym, meta in ticker_meta.items():
+        if sym not in raw.columns:
+            continue
+        value_df[sym] = raw[sym] * meta["qty"] * meta["mult"]
+
+    if value_df.empty:
+        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
+
+    total_hist = value_df.sum(axis=1).to_frame("total")
+
+    # region history — scale total by today's region % split each day
+    region_hist = pd.DataFrame(index=total_hist.index)
+    for r, v in regions_snapshot.items():
+        if v > 0 and total_snapshot > 0:
+            region_hist[r.title()] = total_hist["total"] * (v / total_snapshot)
+
+    # sector history — same approach
+    sector_hist = pd.DataFrame(index=total_hist.index)
+    for s, v in sectors_snapshot.items():
+        if v > 0 and total_snapshot > 0:
+            sector_hist[s.title()] = total_hist["total"] * (v / total_snapshot)
+
+    return total_hist, region_hist, sector_hist
+
+
 def analyze_portfolio_with_api(holdings_list):
     region_summary = {"canada": 0.0, "us": 0.0, "international": 0.0}
     sector_summary = {}
@@ -282,7 +347,7 @@ def analyze_portfolio_with_api(holdings_list):
         except Exception as e:
             st.error(f"Could not process {entry}: {e}")
 
-    return region_summary, sector_summary, stock_exposure, total_val
+    return region_summary, sector_summary, stock_exposure, total_val, usdcad_rate
 
 
 # website UI
@@ -291,13 +356,12 @@ st.title("Portfolio Exposure Analyzer")
 
 user_input = st.text_area(
     "Enter Holdings: TICKER(QTY) or FUNDCODE(QTY) — one per line",
-    value="VFV.TO(50)\nTD.TO(100)\nMSFT(20)\nXEF.TO(100)\nRBF460(200)\nTDB902(150)",
-)
+    value="VFV.TO(50)\nTD.TO(100)\nMSFT(20)\nXEF.TO(100)\nRBF460(200)\nTDB902(150)", height=500)
 
-if st.button("Analyze Portfolio"):
+if st.button("Analyze Portfolio", type = "primary"):
     with st.spinner("Fetching data..."):
         portfolio = [line for line in user_input.strip().split("\n") if line.strip()]
-        regions, sectors, stocks, total = analyze_portfolio_with_api(portfolio)
+        regions, sectors, stocks, total, usdcad_rate = analyze_portfolio_with_api(portfolio)
 
     st.divider()
     st.header(f"Total Portfolio Value: ${total:,.2f} CAD")
@@ -317,6 +381,37 @@ if st.button("Analyze Portfolio"):
         fig_sec = px.pie(sector_df, values="Value", names="Sector", hole=0.4,
                          color_discrete_sequence=px.colors.qualitative.Safe)
         st.plotly_chart(fig_sec, use_container_width=True)
+
+    st.divider()
+    st.subheader("Portfolio Value Over Time (1Y)")
+
+    total_hist, region_hist, sector_hist = get_portfolio_history(portfolio, usdcad_rate, regions, sectors, total)
+
+    if not total_hist.empty:
+        col_h1, col_h2 = st.columns(2)
+
+        with col_h1:
+            st.markdown("**By Region**")
+            # melt so total + each region are separate lines
+            region_plot = region_hist.copy()
+            region_plot["Total"] = total_hist["total"]
+            region_plot.index.name = "Date"
+            region_plot = region_plot.reset_index().melt("Date", var_name="Series", value_name="Value (CAD)")
+            fig_rh = px.line(region_plot, x="Date", y="Value (CAD)", color="Series",
+                             color_discrete_sequence=px.colors.qualitative.Pastel)
+            st.plotly_chart(fig_rh, use_container_width=True)
+
+        with col_h2:
+            st.markdown("**By Sector**")
+            sector_plot = sector_hist.copy()
+            sector_plot["Total"] = total_hist["total"]
+            sector_plot.index.name = "Date"
+            sector_plot = sector_plot.reset_index().melt("Date", var_name="Series", value_name="Value (CAD)")
+            fig_sh = px.line(sector_plot, x="Date", y="Value (CAD)", color="Series",
+                             color_discrete_sequence=px.colors.qualitative.Safe)
+            st.plotly_chart(fig_sh, use_container_width=True)
+    else:
+        st.info("No historical data available for these holdings.")
 
     st.divider()
     st.subheader("Top Individual Stock Exposure")
